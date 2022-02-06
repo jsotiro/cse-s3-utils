@@ -1,0 +1,14 @@
+{"school_name": "Lambda Academy",
+  "class": "Year 1",
+  "info": {
+    "president": "John C",
+    "address": "Avro Road, London, S3, UK",
+    "contacts": {"email": "admin@lambdas.r.us", "tel": "123456789"}},
+  "students":
+  [{"id": "A001", "name": "Diego", "math": 90, "physics": 76, "chemistry": 81},
+    {"id": "A002", "name": "Ian", "math": 89, "physics": 86, "chemistry": 71},
+    {"id": "A003", "name": "Imran", "math": 79, "physics": 70, "chemistry": 78},
+    {"id": "A004", "name": "Darragh", "math": 71, "physics": 79, "chemistry": 90},
+    {"id": "A005", "name": "Mark", "math": 76, "physics": 80, "chemistry": 77}
+  ]
+}
