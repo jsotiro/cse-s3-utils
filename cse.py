@@ -90,13 +90,20 @@ class KMSCryptoContext(CryptoContext):
 
     def get_decryption_aes_key(self, data_key: bytes, material_description: Dict[str, Any]) -> bytes:
         if self.kms_key is None:
+            self.kms_key = material_description['kms_cmk_id']
+        if self.kms_key is None:
             raise ValueError('KMS Key not provided during initialisation, cannot decrypt data key')
         kms_response = self._kms_client.decrypt(KeyId=self.kms_key, CiphertextBlob=data_key)
         return kms_response['Plaintext']
 
+    def get_kms_arn_id(self ):
+        response = self._kms_client.describe_key(KeyId=self.kms_key)
+        return response['KeyMetadata']['Arn']
+
     def get_encryption_aes_key(self) -> Tuple[bytes, Dict[str, str], str]:
         if self.kms_key is None:
             raise ValueError('KMS Key not provided during initialisation, cannot generate data key')
+        self.kms_key = self.get_kms_arn_id()
         encryption_context = {'kms_cmk_id': self.kms_key}
         key_response = self._kms_client.generate_data_key(KeyId=self.kms_key, KeySpec='AES_256')
         return key_response['Plaintext'], encryption_context, base64.b64encode(key_response['CiphertextBlob']).decode()
@@ -111,12 +118,15 @@ class S3CSE(object):
     :param s3_client_args: Optional dict of S3 client args
     """
 
-    def __init__(self, crypto_context: CryptoContext, s3_client_args: Optional[dict] = None):
+    def __init__(self, crypto_context: CryptoContext, s3_client=None, s3_client_args: Optional[dict] = None):
         self._backend = default_backend()
         self._crypto_context = crypto_context
         self._session = None
-        self._s3_client = None
+        self._s3_client = s3_client
         self._s3_client_args = s3_client_args if s3_client_args else {}
+
+    def boto3_s3(self):
+        return  self._s3_client
 
     def setup(self):
         self._s3_client = boto3.client("s3")
@@ -184,7 +194,6 @@ class S3CSE(object):
 
         decryption_key = base64.b64decode(metadata['x-amz-key-v2'])
         material_description = json.loads(metadata['x-amz-matdesc'])
-
         aes_key = self._crypto_context.get_decryption_aes_key(decryption_key, material_description)
 
         # x-amz-key-v2 - Contains base64 encrypted key
@@ -194,6 +203,9 @@ class S3CSE(object):
         # x-amz-wrap-alg - Key wrapping algo, either AESWrap, RSA/ECB/OAEPWithSHA-256AndMGF1Padding or KMS
         # x-amz-cek-alg - AES/GCM/NoPadding or AES/CBC/PKCS5Padding
         # x-amz-tag-len - AEAD Tag length in bits
+
+
+
 
         iv = base64.b64decode(metadata['x-amz-iv'])
         # TODO look at doing AES as stream

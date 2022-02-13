@@ -1,10 +1,11 @@
-import base64
 import logging
-import struct
+import time
+
 import boto3
-import io
-import os
-from Crypto.Cipher import AES
+
+import utils
+from cse import KMSCryptoContext, S3CSE
+from cse_performance_counters import CsePerformanceCounters
 
 # logger config
 logger = logging.getLogger()
@@ -14,95 +15,79 @@ logging.basicConfig(level=logging.INFO,
 
 class S3CseClient:
 
-    def __init__(self, key_id=None):
-        self.kms = boto3.client("kms")
-        self.chunksize = 64 * 1024
-        self.s3 = boto3.client('s3')
+    def __init__(self, key_id, perf_counters=None):
+        operations_log = []
+        self._s3_client = boto3.client("s3")
         self.key_id = key_id
+        self._ctx = KMSCryptoContext(keyid=key_id, kms_client_args={'region_name': 'eu-west-2'})
+        self._s3cse = S3CSE(crypto_context=self._ctx, s3_client=self._s3_client)
+        self.last_operation_duration = 0
+        self.perf_counters = perf_counters
 
     def write(self, bucket, filename, data):
-        # Generate a Data Key (encrypted with KMS CMK)
-        key = self.kms.generate_data_key(KeyId=self.key_id, KeySpec='AES_256')
-        dataKeyPlain = key['Plaintext']
-        dataKey = key['CiphertextBlob']
-        # Encrypt bytes with the data key
-        logging.info("Creating the IV and cipher")
-        iv = os.urandom(16)
-        cipher = AES.new(dataKeyPlain, AES.MODE_GCM, iv)
+        cse_used = self.key_id is not None
+        if cse_used:
+            encryption_msg = f"CSE using CMK {self.key_id}"
+        else:
+            encryption_msg = f"no CSE"
 
-        logging.info("Plain-text data key = %s " % base64.b64encode(dataKeyPlain))
-        logging.info("Encrypted data key  = %s " % base64.b64encode(dataKey))
-        logging.info("Encrypting data")
-        data_size = len(data)
-        f_in = io.BytesIO()
-        f_in.write(data)
-        f_in.seek(0)
-
-        f_out = io.BytesIO()
-        f_out.write(struct.pack('<Q', data_size))
-        f_out.write(iv)
-        chunk = f_in.read(self.chunksize)
-        while len(chunk) != 0:
-            if len(chunk) % 16 != 0:
-                chunk += b' ' * (16 - len(chunk) % 16)
-                enc_buffer = cipher.encrypt(chunk)
-                f_out.write(enc_buffer)
-                chunk = f_in.read(self.chunksize)
-        #
-        # Store encrypted file on S3
-        # Encrypted Key will be stored as meta data
-        #
-        logging.info("Storing encrypted file on S3")
-        metadata = {
-            "key": base64.b64encode(dataKey).decode("utf-8")
-        }
-        f_out.seek(0)
-        encrypted_data = f_out.getvalue()
-        response = self.s3.put_object(Bucket=bucket,
-                                      Key=filename,
-                                      ContentType='binary/data',
-                                      Body=encrypted_data, Metadata=metadata)
+        logging.info(f"Writing object and its metadata to S3 ({encryption_msg})")
+        start = time.process_time()
+        response = self._s3cse.put_object(data, bucket, filename)
+        finish = time.process_time()
+        self.last_operation_duration = finish - start
+        self.add_perf_counter(bucket,
+                              filename,
+                              CsePerformanceCounters.write,
+                              cse_used,
+                              self.last_operation_duration)
+        logging.info(f"{filename} was writen in {utils.format_time_elapsed(self.last_operation_duration)}")
         return response
 
     def read(self, bucket, filename):
-        # download encrypted object and it's metadata
-        logging.info("Download object and its metadata from S3")
-        response = self.s3.get_object(Bucket=bucket,
-                                      Key=filename)
-        #
-        # retrieve data key from response.metadata
-        dataKey = base64.b64decode(response['Metadata']['key'])
-        # decrypt encrypted key
-        logging.info("Decrypt data key")
-        key = self.kms.decrypt(KeyId=self.key_id, CiphertextBlob=dataKey)
-        dataKeyPlain = key['Plaintext']
-        logging.info("Plain text data key = %s " % base64.b64encode(dataKeyPlain))
-        logging.info("Encrypted  data key  = %s " % base64.b64encode(dataKey))
+        start = time.process_time()
+        logging.info("Downloading object and its metadata from S3")
+        start = time.process_time()
+        response = self._s3cse.get_object(bucket, filename)
+        finish = time.process_time()
+        self.last_operation_duration = finish - start
+        self.add_perf_counter(bucket,
+                              filename,
+                              CsePerformanceCounters.read,
+                              self.is_encrypted(response['Metadata']),
+                              self.last_operation_duration)
+        result = response['Body'].read()
+        logging.info(f"{filename} was read in {utils.format_time_elapsed(self.last_operation_duration)}")
+        return result
 
-        logging.info("Decrypt the object")
-        enc_data = response['Body'].read()
-        f_in = io.BytesIO()
-        f_in.write(enc_data)
-        f_in.seek(0)
-        origsize = struct.unpack('<Q', f_in.read(struct.calcsize('Q')))[0]
-        iv = f_in.read(16)
-        cipher = AES.new(dataKeyPlain, AES.MODE_GCM, iv)
-        chunk = f_in.read(self.chunksize)
-        f_out = io.BytesIO()
-        while len(chunk) != 0:
-            f_out.write(cipher.decrypt(chunk))
-            chunk = f_in.read(self.chunksize)
-            f_out.truncate(origsize)
-        f_out.seek(0)
-        data = f_out.getvalue()
-        return data
+    def is_encrypted(self, metadata):
+        return utils.is_encrypted(metadata)
+
+    def get_metadata(self, bucket, filename, extended=False):
+        logging.info("Retrieving object metadata from S3 without downloading the object itself")
+        start = time.process_time()
+        response = self._s3_client.head_object(Bucket=bucket, Key=filename)
+        finish = time.process_time()
+        self.last_operation_duration = finish - start
+        self.add_perf_counter(bucket, filename, CsePerformanceCounters.head, None, self.last_operation_duration)
+        logging.info(f"Metadata for {filename} was read in {utils.format_time_elapsed(self.last_operation_duration)}")
+        if extended:
+            result = response
+        else:
+            result = response['Metadata']
+        return result
+
+    def add_perf_counter(self, bucket, filename, operation, cse, duration):
+        if self.perf_counters:
+            self.perf_counters.add_counter(bucket, filename, operation, cse, duration)
+
 
 if __name__ == '__main__':
     key_arn = 'arn:aws:kms:eu-west-2:299691842772:alias/SSE'
     bucket_name = 'leansec-sse-test-bucket'
     object_name = 'test.enc'
 
-    s3_cse_client = S3CseClient()
+    s3_cse_client = S3CseClient(key_arn)
     s3_cse_client.key_id = key_arn
     resp = s3_cse_client.write(bucket_name, object_name, b'hello encrypted data')
     print(resp)
