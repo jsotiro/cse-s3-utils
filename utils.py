@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 import numpy as np
 
@@ -24,13 +26,20 @@ def format_time_elapsed(t):
     return f"{t} seconds"
 
 
+def generated_object_key(object_key, keyword, extension):
+    file_parts = os.path.splitext(object_key)
+    addition = "" if not keyword else f"-{keyword}"
+    file_name = f"{file_parts[0]}{addition}.{extension}"
+    return file_name
+
+
 def counters_summary_df(counters_df, index_col, label_col, values_col):
     simple_df = counters_df[[index_col, label_col, values_col]]
     results_df = pd.DataFrame()
     group_names = np.unique(simple_df[label_col].values)
     for value in group_names:
         subset_df = simple_df[simple_df[label_col] == value].copy()
-        subset_df.rename(columns={values_col : value}, inplace=True)
+        subset_df.rename(columns={values_col: value}, inplace=True)
         subset_df.set_index(index_col, inplace=True)
         if results_df.empty:
             results_df = subset_df
